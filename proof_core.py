@@ -509,13 +509,7 @@ def check_page(fp: FaxPage, master: MenuMaster, year: int, month: int,
         if wd in fp.columns and d not in seen:
             add("②曜日", d, f"{d}日({wd})が必要", "見つかりません")
 
-    # 店休日(店舗ごとに独自の休みがあるため「要確認」扱い)
-    for d, c in seen.items():
-        mi = master.days.get(d)
-        exp_closed = bool(mi and mi.closed)
-        if exp_closed != c.closed:
-            add("②店休日", d, "店休日" if exp_closed else "営業日",
-                "店休日(グレー)" if c.closed else "営業日", level="要確認")
+    # 店休日は店舗ごとに違うためチェックしない(店休日のマスは③も対象外)
 
     # ③ 旗日(店休日のマスは対象外)
     for d, c in seen.items():
@@ -552,5 +546,5 @@ def check_page(fp: FaxPage, master: MenuMaster, year: int, month: int,
             add("④イベント", c.day, "(中面にイベントなし)", c.event_text)
 
     for w in fp.warnings:
-        add("読み取り", "", "", w, level="要確認")
+        add("読み取り", "", "", w)
     return issues

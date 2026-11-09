@@ -16,11 +16,11 @@ with st.expander("チェックする内容", expanded=False):
     st.markdown(
         """
 - **① 年・月・日付**:左上の年・月、期間(例: 12/1〜12/31)
-- **② 曜日**:各日付が正しい曜日の列にあるか、抜けや前月・翌月の日付がないか、店休日(グレーの日付)
+- **② 曜日**:各日付が正しい曜日の列にあるか、抜けや前月・翌月の日付がないか
 - **③ 旗日の文字**:フェア名・プレミアム・スペシャル、日付の黒地、贅沢版の混ぜご飯
 - **④ イベントWeek**:表記と期間
 
-店休日は店舗ごとに異なることがあるため「要確認」として表示します。
+店休日(グレーの日付)は店舗ごとに違うためチェックしません。店休日のマスは③も対象外です。
 """
     )
 
@@ -111,6 +111,23 @@ if st.button("校正をはじめる", type="primary"):
 if not st.session_state.get("run"):
     st.stop()
 
+def describe(i) -> str:
+    """指摘を1行の文章にする"""
+    item = i.item[1:] if i.item[:1] in "①②③④" else i.item
+    if i.item == "①年月日" and "/" in i.expected:
+        item = "期間"
+    elif i.item == "①年月日" and "月" in i.expected:
+        item = "月"
+    elif i.item == "①年月日":
+        item = "年"
+    head = f"【{item}】" + (f"{i.day}日 " if i.day and i.day.isdigit() else (f"{i.day} " if i.day else ""))
+    if i.item == "読み取り":
+        return head + i.actual
+    if i.item == "②曜日" and i.actual.endswith(("列にあります", "表示されています", "見つかりません")):
+        return head + f"{i.actual}(正: {i.expected})"
+    return head + f"「{i.actual}」→ 正しくは「{i.expected}」"
+
+
 issues, summary = [], []
 for f in fax_files:
     pages = load_fax(f.getvalue(), f.name)
@@ -121,55 +138,76 @@ for f in fax_files:
             d["file"] = f.name
             issues.append(d)
         n_err = sum(i.level == "エラー" for i in page_issues)
-        n_chk = sum(i.level == "要確認" for i in page_issues)
         summary.append({
-            "ファイル": f.name, "ページ": fp.page_no, "店舗番号": fp.store_no,
-            "店舗": fp.store_name, "種類": fp.variant,
-            "判定": "❌ エラー" if n_err else ("⚠️ 要確認" if n_chk else "✅ OK"),
-            "エラー": n_err, "要確認": n_chk,
+            "判定": "❌ エラー" if n_err else "✅ OK",
+            "ページ": fp.page_no, "店舗": fp.store_name or fp.store_no, "種類": fp.variant,
+            "エラーの内容": " ／ ".join(describe(i) for i in page_issues),
+            "ファイル": f.name, "エラー": n_err,
         })
 
 # ------------------------------------------------------------ 3. 結果
 st.header("3. 結果")
 sdf = pd.DataFrame(summary)
 idf = pd.DataFrame(issues)
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3 = st.columns(3)
 c1.metric("ページ数", len(sdf))
-c2.metric("OK", int((sdf["判定"] == "✅ OK").sum()))
-c3.metric("エラーのあるページ", int((sdf["エラー"] > 0).sum()))
-c4.metric("要確認のあるページ", int(((sdf["エラー"] == 0) & (sdf["要確認"] > 0)).sum()))
+c2.metric("✅ OK", int((sdf["判定"] == "✅ OK").sum()))
+c3.metric("❌ エラーのあるページ", int((sdf["エラー"] > 0).sum()))
 
-if not idf.empty:
-    idf = idf.rename(columns={"file": "ファイル", "page": "ページ", "store": "店舗", "item": "項目",
-                              "day": "日", "expected": "正しい内容", "actual": "注文書の内容", "level": "区分"})
-    idf = idf[["区分", "ファイル", "ページ", "店舗", "項目", "日", "正しい内容", "注文書の内容"]]
-
-    # 全ページ共通のエラー(テンプレート由来)はまとめて表示
-    n_pages = len(sdf)
-    key = ["区分", "項目", "日", "正しい内容", "注文書の内容"]
-    common = idf.groupby(key).size().reset_index(name="ページ数")
-    common = common[common["ページ数"] == n_pages]
-    if not common.empty and n_pages > 1:
-        st.subheader("全ページ共通の指摘")
-        st.dataframe(common, hide_index=True, use_container_width=True)
-        idf_rest = idf.merge(common[key], on=key, how="left", indicator=True)
-        idf_rest = idf_rest[idf_rest["_merge"] == "left_only"].drop(columns="_merge")
-    else:
-        idf_rest = idf
-
-    st.subheader("ページごとの指摘")
-    levels = st.multiselect("表示する区分", ["エラー", "要確認"], default=["エラー", "要確認"])
-    st.dataframe(idf_rest[idf_rest["区分"].isin(levels)], hide_index=True, use_container_width=True)
-else:
-    st.success("指摘はありませんでした 🎉")
+# 全ページ共通の指摘(テンプレート由来のミス)
+n_pages = len(sdf)
+if not idf.empty and n_pages > 1:
+    cnt = {}
+    for i in issues:
+        k = (i["level"], i["item"], i["day"], i["expected"], i["actual"])
+        cnt[k] = cnt.get(k, 0) + 1
+    from proof_core import Issue
+    common = [Issue(0, "", k[1], k[2], k[3], k[4], k[0]) for k, v in cnt.items() if v == n_pages]
+    if common:
+        st.error("**全ページ共通のエラー**(元のデータ自体のミスの可能性があります)\n\n"
+                 + "\n".join(f"- {describe(i)}" for i in common))
 
 st.subheader("ページ一覧")
-st.dataframe(sdf, hide_index=True, use_container_width=True)
+show = st.radio("表示", ["すべて", "❌ エラーのみ", "✅ OKのみ"], horizontal=True)
+view = sdf
+if show == "❌ エラーのみ":
+    view = sdf[sdf["エラー"] > 0]
+elif show == "✅ OKのみ":
+    view = sdf[sdf["判定"] == "✅ OK"]
+cols = ["判定", "ページ", "店舗", "種類", "エラーの内容"]
+if len(fax_files) > 1:
+    cols.append("ファイル")
+st.dataframe(
+    view[cols], hide_index=True, use_container_width=True,
+    height=min(600, 38 + 35 * max(1, len(view))),
+    column_config={
+        "ページ": st.column_config.NumberColumn(width="small"),
+        "エラーの内容": st.column_config.TextColumn(width="large"),
+    },
+)
+st.caption("セルにマウスを乗せると全文が見られます。")
+
+if not idf.empty:
+    with st.expander("指摘の一覧(1件ずつ)"):
+        d = idf.rename(columns={"file": "ファイル", "page": "ページ", "store": "店舗", "item": "項目",
+                                "day": "日", "expected": "正しい内容", "actual": "注文書の内容", "level": "区分"})
+        st.dataframe(d[["ページ", "店舗", "項目", "日", "注文書の内容", "正しい内容", "ファイル"]],
+                     hide_index=True, use_container_width=True)
 
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-    sdf.to_excel(xw, sheet_name="ページ一覧", index=False)
-    (idf if not idf.empty else pd.DataFrame()).to_excel(xw, sheet_name="指摘一覧", index=False)
+    sdf.drop(columns=["エラー"]).to_excel(xw, sheet_name="ページ一覧", index=False)
+    if not idf.empty:
+        idf.rename(columns={"file": "ファイル", "page": "ページ", "store": "店舗", "item": "項目",
+                            "day": "日", "expected": "正しい内容", "actual": "注文書の内容", "level": "区分"}
+                   ).drop(columns=["区分"]).to_excel(xw, sheet_name="指摘一覧", index=False)
+    ws = xw.sheets["ページ一覧"]
+    for col, w in zip("ABCDEF", [10, 6, 36, 18, 70, 30]):
+        ws.column_dimensions[col].width = w
+    from openpyxl.styles import Alignment
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
 st.download_button("結果をExcelでダウンロード", buf.getvalue(),
                    file_name=f"校正結果_{year}年{month}月.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
