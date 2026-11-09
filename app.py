@@ -128,6 +128,15 @@ def describe(i) -> str:
     return head + f"「{i.actual}」→ 正しくは「{i.expected}」"
 
 
+# 校正した項目(ページ一覧の列)と、対応する指摘
+CHECK_COLS = {
+    "①年月日": ["①年月日"],
+    "②曜日": ["②曜日", "読み取り"],
+    "③旗日": ["③旗日"],
+    "③混ぜご飯": ["③混ぜご飯"],
+    "④イベント": ["④イベント"],
+}
+
 issues, summary = [], []
 for f in fax_files:
     pages = load_fax(f.getvalue(), f.name)
@@ -138,15 +147,45 @@ for f in fax_files:
             d["file"] = f.name
             issues.append(d)
         n_err = sum(i.level == "エラー" for i in page_issues)
+        bad = {i.item for i in page_issues}
+        marks = {col: ("❌" if any(it in bad for it in items) else "✅")
+                 for col, items in CHECK_COLS.items()}
+        if not fp.zeitaku:
+            marks["③混ぜご飯"] = "✅(なし)" if marks["③混ぜご飯"] == "✅" else "❌"
+        if fixed.event_range is None and marks["④イベント"] == "✅":
+            marks["④イベント"] = "✅(なし)"
         summary.append({
             "判定": "❌ エラー" if n_err else "✅ OK",
             "ページ": fp.page_no, "店舗": fp.store_name or fp.store_no, "種類": fp.variant,
+            **marks,
             "エラーの内容": " ／ ".join(describe(i) for i in page_issues),
             "ファイル": f.name, "エラー": n_err,
         })
 
 # ------------------------------------------------------------ 3. 結果
 st.header("3. 結果")
+
+# 校正した項目と、照合に使った正しい内容
+flags = [f"{d}日 {v.flag}" for d, v in sorted(fixed.days.items()) if v.flag]
+maze = [str(d) for d, v in sorted(fixed.days.items()) if v.mazegohan]
+first_wd = "月火水木金土日"[calendar.weekday(int(year), int(month), 1)]
+checked = pd.DataFrame([
+    {"項目": "①年月日", "校正した内容": "左上の年・月・期間",
+     "正しい内容": f"{year}年 {month}月 ／ 期間 {month}/1〜{month}/{last}"},
+    {"項目": "②曜日", "校正した内容": "日付が正しい曜日の列にあるか、抜け・前月翌月の日付がないか",
+     "正しい内容": f"{month}月1日は{first_wd}曜、{last}日まで"},
+    {"項目": "③旗日", "校正した内容": "旗日の文字と、日付の黒地",
+     "正しい内容": "、".join(flags) or "なし"},
+    {"項目": "③混ぜご飯", "校正した内容": "贅沢版の混ぜご飯の表記(通常版は表記がないこと)",
+     "正しい内容": ("・".join(maze) + "日") if maze else "なし"},
+    {"項目": "④イベント", "校正した内容": "イベントWeekの表記と期間",
+     "正しい内容": (f"{event_name + ' ' if event_name else ''}{fixed.event_range[0]}日〜{fixed.event_range[1]}日"
+                if fixed.event_range else "なし")},
+])
+st.subheader("校正した項目")
+st.dataframe(checked, hide_index=True, use_container_width=True)
+st.caption("店休日(グレーの日付)は店舗ごとに違うためチェックしていません。店休日のマスは③も対象外です。")
+
 sdf = pd.DataFrame(summary)
 idf = pd.DataFrame(issues)
 c1, c2, c3 = st.columns(3)
@@ -174,7 +213,7 @@ if show == "❌ エラーのみ":
     view = sdf[sdf["エラー"] > 0]
 elif show == "✅ OKのみ":
     view = sdf[sdf["判定"] == "✅ OK"]
-cols = ["判定", "ページ", "店舗", "種類", "エラーの内容"]
+cols = ["判定", "ページ", "店舗", "種類", *CHECK_COLS.keys(), "エラーの内容"]
 if len(fax_files) > 1:
     cols.append("ファイル")
 st.dataframe(
@@ -196,18 +235,21 @@ if not idf.empty:
 
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+    checked.to_excel(xw, sheet_name="校正した項目", index=False)
     sdf.drop(columns=["エラー"]).to_excel(xw, sheet_name="ページ一覧", index=False)
     if not idf.empty:
         idf.rename(columns={"file": "ファイル", "page": "ページ", "store": "店舗", "item": "項目",
                             "day": "日", "expected": "正しい内容", "actual": "注文書の内容", "level": "区分"}
                    ).drop(columns=["区分"]).to_excel(xw, sheet_name="指摘一覧", index=False)
-    ws = xw.sheets["ページ一覧"]
-    for col, w in zip("ABCDEF", [10, 6, 36, 18, 70, 30]):
-        ws.column_dimensions[col].width = w
     from openpyxl.styles import Alignment
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    widths = {"校正した項目": [12, 50, 70], "ページ一覧": [10, 6, 36, 18, 10, 10, 10, 12, 10, 70, 30]}
+    for name, ws_widths in widths.items():
+        ws = xw.sheets[name]
+        for n, w in enumerate(ws_widths):
+            ws.column_dimensions[chr(65 + n)].width = w
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
 st.download_button("結果をExcelでダウンロード", buf.getvalue(),
                    file_name=f"校正結果_{year}年{month}月.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
