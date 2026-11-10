@@ -4,3 +4,4 @@ pypdfium2
 pandas
 numpy
 openpyxl
+pypdf

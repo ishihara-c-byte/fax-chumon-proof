@@ -110,6 +110,134 @@ def vertical_text(chars):
     return out
 
 
+# ---------------------------------------------------------------- 非表示レイヤー
+def strip_hidden_layers(pdf_bytes: bytes) -> bytes:
+    """Illustratorの「非表示レイヤー」(PDFのオプションコンテンツOFF)の中身を取り除く。
+    見えていない古いカレンダーなどが文字として残っていることがあるため。"""
+    import io
+    try:
+        import pypdf
+        from pypdf.generic import ContentStream
+    except Exception:
+        return pdf_bytes
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        ocp = reader.trailer["/Root"].get("/OCProperties")
+        if not ocp:
+            return pdf_bytes
+        ocp = ocp.get_object()
+        off = ocp.get("/D", {}).get_object().get("/OFF", [])
+        off_ids = {o.idnum for o in off if hasattr(o, "idnum")}
+        if not off_ids:
+            return pdf_bytes
+        writer = pypdf.PdfWriter(clone_from=reader)
+        changed = False
+        # 番号はコピー後に変わるため、元のPDFのページで非表示レイヤー名を調べる
+        for rpage, page in zip(reader.pages, writer.pages):
+            res = rpage.get("/Resources")
+            res = res.get_object() if res is not None else {}
+            props = res.get("/Properties")
+            props = props.get_object() if props is not None else {}
+            hidden = set()
+            for name, ref in props.items():
+                if hasattr(ref, "idnum") and ref.idnum in off_ids:
+                    hidden.add(name)
+            if not hidden or page.get_contents() is None:
+                continue
+            cs = ContentStream(page.get_contents(), writer)
+            ops, skip = [], 0
+            for operands, op in cs.operations:
+                if skip:
+                    if op in (b"BDC", b"BMC"):
+                        skip += 1
+                    elif op == b"EMC":
+                        skip -= 1
+                    continue
+                if op == b"BDC" and len(operands) >= 2 and operands[0] == "/OC" and operands[1] in hidden:
+                    skip = 1
+                    continue
+                ops.append((operands, op))
+            cs.operations = ops
+            page.replace_contents(cs)
+            changed = True
+        if not changed:
+            return pdf_bytes
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception:
+        return pdf_bytes
+
+
+def _hidden_layer_keys(pdf_bytes: bytes) -> set:
+    """非表示レイヤーの名前(pdfiumのマークと比べるための形)"""
+    import io
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        ocp = reader.trailer["/Root"].get("/OCProperties")
+        if not ocp:
+            return set()
+        off = ocp.get_object().get("/D", {}).get_object().get("/OFF", [])
+        keys = set()
+        for o in off:
+            name = o.get_object().get("/Name")
+            if name is None:
+                continue
+            raw = getattr(name, "original_bytes", None) or str(name).encode("utf-16-be")
+            if raw[:2] in (b"\xfe\xff", b"\xff\xfe"):
+                raw = raw[2:]
+            keys.add(raw.decode("latin-1"))
+        return keys
+    except Exception:
+        return set()
+
+
+def _pdfium_visible_text(pdfium_page, left, top, right, bottom, hidden_keys) -> str:
+    """pdfiumで範囲内の文字を読む(非表示レイヤーの文字は除く)"""
+    import ctypes
+    import pypdfium2.raw as raw
+
+    def _s(fn, *a):
+        buf = (ctypes.c_ushort * 512)()
+        ln = ctypes.c_ulong()
+        ok = fn(*a, buf, ctypes.sizeof(buf), ctypes.byref(ln))
+        return ok, bytes(buf)[:ln.value].decode("utf-16-le", "ignore").rstrip("\x00")
+
+    def hidden(obj):
+        for k in range(raw.FPDFPageObj_CountMarks(obj)):
+            mk = raw.FPDFPageObj_GetMark(obj, k)
+            _, name = _s(raw.FPDFPageObjMark_GetName, mk)
+            if name != "OC":
+                continue
+            ok, val = _s(raw.FPDFPageObjMark_GetParamStringValue, mk, b"Name")
+            if ok and val in hidden_keys:
+                return True
+        return False
+
+    h = pdfium_page.get_height()
+    tp = pdfium_page.get_textpage()
+    out = []
+    for i in range(tp.count_chars()):
+        l, b, r, t = tp.get_charbox(i)
+        if not (left <= l and r <= right and top <= h - t and h - b <= bottom):
+            continue
+        if hidden_keys and hidden(raw.FPDFText_GetTextObject(tp.raw, i)):
+            continue
+        out.append((round(h - t), l, tp.get_text_range(i, 1)))
+    out.sort(key=lambda x: (x[0] // 6, x[1]))
+    return "".join(x[2] for x in out)
+
+
+def _to_bytes(path_or_file) -> bytes:
+    if isinstance(path_or_file, (bytes, bytearray)):
+        return bytes(path_or_file)
+    if hasattr(path_or_file, "read"):
+        return path_or_file.read()
+    with open(path_or_file, "rb") as f:
+        return f.read()
+
+
 # ---------------------------------------------------------------- 中面
 
 @dataclass
@@ -173,7 +301,9 @@ def _undouble(t: str) -> str:
 
 
 def parse_menu(path_or_file) -> MenuMaster:
-    with pdfplumber.open(path_or_file) as pdf:
+    import io
+    data = strip_hidden_layers(_to_bytes(path_or_file))
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
         page = pdf.pages[0]
         words = page.extract_words(extra_attrs=["size", "non_stroking_color"])
         rects = page.rects
@@ -304,6 +434,7 @@ class FaxPage:
     period: str = ""
     columns: list[str] = field(default_factory=list)
     zeitaku: bool = False
+    header_bottom: float = 0.0
     cells: list[FaxCell] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -443,11 +574,14 @@ def parse_fax_page(page, page_no, img=None, scale=2.0) -> FaxPage:
         cell.black_box = t["color"] == "white"
         cell.gray = t["color"] == "gray"
 
-        strip_x1 = t["x0"] + 32  # 日付の下の細い帯
+        # 日付の下の細い帯(日付の黒地の幅=2桁分。1桁の日付は黒地の中央に置かれている)
+        center = (t["x0"] + t["x1"]) / 2
+        strip_x0 = center - t["size"] * 0.5 - 1.5
+        strip_x1 = center + t["size"] * 0.5 + 1
         in_cell = [c for c in small if x0 <= c["x0"] < x1 and y0 <= c["top"] < y1]
-        strip = [c for c in in_cell if c["x0"] < strip_x1]
+        strip = [c for c in in_cell if strip_x0 <= c["x0"] and c["x1"] <= strip_x1 + 1.5]
         label = [c for c in strip if color_kind(c["non_stroking_color"]) == "black"
-                 and c["size"] >= 8.5 and visible_dark(c)]
+                 and c["size"] >= 6.8 and visible_dark(c)]
         white = [c for c in strip if color_kind(c["non_stroking_color"]) == "white"
                  and c["size"] > 3 and visible_white(c)]
         cell.flag = norm(vertical_text(label))
@@ -470,6 +604,7 @@ def parse_fax_page(page, page_no, img=None, scale=2.0) -> FaxPage:
     # ヘッダー(年・月・期間)
     # 左上の「12 2026 12/1〜12/31」の枠(最初の日付行より上、ページ左側)
     first_row = min(t["top"] for t in base)
+    fp.header_bottom = first_row - 40
     header = [c for c in chars if c["top"] < first_row - 40 and c["x0"] < page.width * 0.3]
     nums = group_chars_to_numbers([c for c in header if c["text"].isdigit()])
     if nums:
@@ -492,11 +627,15 @@ def parse_fax_page(page, page_no, img=None, scale=2.0) -> FaxPage:
 def parse_fax(pdf_bytes: bytes, progress=None, scale=2.0) -> list[FaxPage]:
     import io
     import numpy as np
+    original = pdf_bytes
+    hidden_keys = _hidden_layer_keys(original)
+    pdf_bytes = strip_hidden_layers(pdf_bytes)
     try:
         import pypdfium2 as pdfium
         doc = pdfium.PdfDocument(pdf_bytes)
+        orig_doc = pdfium.PdfDocument(original) if pdf_bytes is not original else doc
     except Exception:
-        doc = None
+        doc = orig_doc = None
     pages = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         n = len(pdf.pages)
@@ -504,7 +643,23 @@ def parse_fax(pdf_bytes: bytes, progress=None, scale=2.0) -> list[FaxPage]:
             img = None
             if doc is not None:
                 img = np.asarray(doc[i].render(scale=scale, grayscale=True).to_pil().convert("L"))
-            pages.append(parse_fax_page(page, i + 1, img=img, scale=scale))
+            fp = parse_fax_page(page, i + 1, img=img, scale=scale)
+            # 年・期間の文字が特殊なフォントで読めないときは、別の方法(pdfium)で読み直す
+            if doc is not None and (fp.year is None or not fp.period) and fp.header_bottom > 0:
+                try:
+                    pp = orig_doc[i]
+                    w, h = pp.get_size()
+                    txt = _pdfium_visible_text(pp, 0, 0, w * 0.3, fp.header_bottom, hidden_keys)
+                    txt = unicodedata.normalize("NFKC", txt)
+                    if fp.year is None:
+                        m = re.search(r"20\d\d", txt)
+                        fp.year = int(m.group()) if m else None
+                    if not fp.period:
+                        m = re.search(r"(\d{1,2}/\d{1,2})\s*[〜~～\-]?\s*(\d{1,2}/\d{1,2})", txt)
+                        fp.period = f"{m.group(1)}〜{m.group(2)}" if m else ""
+                except Exception:
+                    pass
+            pages.append(fp)
             page.flush_cache()
             if progress:
                 progress(i + 1, n)
