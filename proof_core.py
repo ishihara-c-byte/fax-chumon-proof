@@ -330,10 +330,21 @@ def parse_menu(path_or_file) -> MenuMaster:
         cell_h = max(heights, key=lambda k: sum(v for kk, v in heights.items() if abs(kk - k) <= 2)) if heights else 0
         # 月初の週は高さが半分のマスもあるため、高さの4割〜同じ高さまでを対象にする
         cells = [r for r in cand_cells if cell_h * 0.4 <= (r["bottom"] - r["top"]) <= cell_h + 4]
+        # カレンダー本体の列だけ(左側の紹介欄などを除く):同じ横位置に4つ以上並ぶもの
+        col_count = {}
+        for r in cells:
+            k = round(r["x0"] / 4)
+            col_count[k] = col_count.get(k, 0) + 1
+        def _in_grid(r):
+            k = round(r["x0"] / 4)
+            return sum(col_count.get(k + d, 0) for d in (-1, 0, 1)) >= 4
+        if any(_in_grid(r) for r in cells):
+            cells = [r for r in cells if _in_grid(r)]
         cells.sort(key=lambda r: -(r["bottom"] - r["top"]))  # 大きいマスを優先
 
         master = MenuMaster(month=month)
         boxes = {}  # day -> (x0, top, x1, bottom)
+        date_size = {}  # day -> 日付の数字の大きさ
         for r in cells:
             x0, top, x1, bottom = r["x0"], r["top"], r["x1"], r["bottom"]
             # マス左上の日付(後ろに文字がくっついている場合もある)
@@ -342,7 +353,9 @@ def parse_menu(path_or_file) -> MenuMaster:
                     and x0 - 2 <= w["x0"] <= x0 + 40 and top - 2 <= w["top"] <= top + 30 and w["size"] >= 9]
             if not cand:
                 continue
-            day = int(re.match(r"\d{1,2}", min(cand, key=lambda w: (w["top"], w["x0"]))["text"]).group())
+            dw = min(cand, key=lambda w: (w["top"], w["x0"]))
+            day = int(re.match(r"\d{1,2}", dw["text"]).group())
+            date_size[day] = max(date_size.get(day, 0), max(w["size"] for w in cand))
             info = master.days.setdefault(day, DayInfo(day))
             if day not in boxes or (x1 - x0) * (bottom - top) >= (boxes[day][2] - boxes[day][0]) * (boxes[day][3] - boxes[day][1]) - 1:
                 boxes[day] = (x0, top, x1, bottom)
@@ -391,6 +404,13 @@ def parse_menu(path_or_file) -> MenuMaster:
                           and top >= r["top"] - 5 and bottom <= r["bottom"] + 5]
                 if len(inside) >= 2:
                     ev_days.update(inside)
+        # 枠が画像などで描かれている場合に備えて、日付の数字が大きくなっている日もイベントとみなす
+        if date_size:
+            sizes = sorted(date_size.values())
+            normal = sizes[len(sizes) // 2]
+            big = [d for d, sz in date_size.items() if sz > normal * 1.2]
+            if len(big) >= 2:
+                ev_days.update(big)
         if ev_days:
             master.event_range = (min(ev_days), max(ev_days))
 
