@@ -117,8 +117,9 @@ class DayInfo:
     day: int
     flag: str = ""          # "スタミナフェア" / "プレミアム" / "スペシャル" / ""
     kind: str = ""          # "fair" / "premium" / "special" / ""
-    mazegohan: bool = False
+    rice: str = ""          # 贅沢弁当の「混ぜご飯」/「ふりかけ」/ ""
     closed: bool = False
+    label: str = ""         # 旗日以外の表記(例: 中華)。日付は黒地にしない
 
 
 @dataclass
@@ -148,15 +149,27 @@ def _rgb(c):
 
 
 def _nearest_kind(c):
+    """マスの背景色から旗日の種類を判定(黄=プレミアム、ピンク=スペシャル、オレンジ=フェア)"""
     rgb = _rgb(c)
     if rgb is None:
         return None
-    best, dist = None, 9.0
-    for k, ref in KIND_COLORS.items():
-        d = sum((a - b) ** 2 for a, b in zip(rgb, ref)) ** 0.5
-        if d < dist:
-            best, dist = k, d
-    return best if dist < 0.06 else None
+    r, g, b = rgb
+    if max(rgb) - min(rgb) < 0.05 or min(rgb) < 0.4:
+        return None  # 白・グレー・濃い色は対象外
+    if g < b - 0.02:
+        return "special"
+    if g - b > 0.2:
+        return "premium"
+    if r - b > 0.1:
+        return "fair"
+    return None
+
+
+def _undouble(t: str) -> str:
+    """太字表現で2回ずつ重なった文字(中中華華)を1回に"""
+    if len(t) >= 2 and len(t) % 2 == 0 and all(t[i] == t[i + 1] for i in range(0, len(t), 2)):
+        return t[::2]
+    return t
 
 
 def parse_menu(path_or_file) -> MenuMaster:
@@ -173,24 +186,36 @@ def parse_menu(path_or_file) -> MenuMaster:
             if big["size"] > 40:
                 month = int(big["text"])
 
-        # 日付マス = 塗りのある 横100〜160 × 縦140〜160 の四角
-        cells = []
-        for r in rects:
+        # 日付マス = 塗りのある四角のうち、いちばん多い高さのもの
+        # (月によって5週・6週でマスの高さが変わるため、高さは固定しない)
+        cand_cells = []
+        for r in rects + [c for c in page.curves if c.get("fill")]:
             w, h = r["x1"] - r["x0"], r["bottom"] - r["top"]
-            if r.get("fill") and 90 < w < 170 and 130 < h < 170:
-                cells.append(r)
+            if r.get("fill") and 60 < w < 230 and 60 < h < 230:
+                cand_cells.append(r)
+        heights = {}
+        for r in cand_cells:
+            hk = round(r["bottom"] - r["top"])
+            heights[hk] = heights.get(hk, 0) + 1
+        cell_h = max(heights, key=lambda k: sum(v for kk, v in heights.items() if abs(kk - k) <= 2)) if heights else 0
+        # 月初の週は高さが半分のマスもあるため、高さの4割〜同じ高さまでを対象にする
+        cells = [r for r in cand_cells if cell_h * 0.4 <= (r["bottom"] - r["top"]) <= cell_h + 4]
+        cells.sort(key=lambda r: -(r["bottom"] - r["top"]))  # 大きいマスを優先
 
         master = MenuMaster(month=month)
         boxes = {}  # day -> (x0, top, x1, bottom)
         for r in cells:
             x0, top, x1, bottom = r["x0"], r["top"], r["x1"], r["bottom"]
-            cand = [w for w in nums
-                    if x0 - 2 <= w["x0"] <= x0 + 40 and top - 2 <= w["top"] <= top + 30 and w["size"] >= 9]
+            # マス左上の日付(後ろに文字がくっついている場合もある)
+            cand = [w for w in words
+                    if re.match(r"\d{1,2}(?!\d)", w["text"])
+                    and x0 - 2 <= w["x0"] <= x0 + 40 and top - 2 <= w["top"] <= top + 30 and w["size"] >= 9]
             if not cand:
                 continue
-            day = int(min(cand, key=lambda w: (w["top"], w["x0"]))["text"])
+            day = int(re.match(r"\d{1,2}", min(cand, key=lambda w: (w["top"], w["x0"]))["text"]).group())
             info = master.days.setdefault(day, DayInfo(day))
-            boxes[day] = (x0, top, x1, bottom)
+            if day not in boxes or (x1 - x0) * (bottom - top) >= (boxes[day][2] - boxes[day][0]) * (boxes[day][3] - boxes[day][1]) - 1:
+                boxes[day] = (x0, top, x1, bottom)
             k = _nearest_kind(r.get("non_stroking_color"))
             if k:
                 info.kind = k
@@ -200,8 +225,17 @@ def parse_menu(path_or_file) -> MenuMaster:
             inside = [w for w in words if x0 <= w["x0"] < x1 and top <= w["top"] < bottom]
             white = [w for w in inside if color_kind(w["non_stroking_color"]) == "white"]
             wt = [w["text"] for w in white]
-            if any("混ぜ" in t for t in wt):
-                info.mazegohan = True
+            if any(t in ("混ぜ", "混ぜご飯") for t in wt):
+                info.rice = "混ぜご飯"
+            elif any(w["text"] in ("ふり", "ふりかけ") and w["size"] < 7.5 for w in inside):
+                info.rice = "ふりかけ"
+            # 旗日以外の大きな表記(例: 中華)
+            badges = [w for w in inside if w["size"] >= 11 and not re.search(r"\d", w["text"])
+                      and color_kind(w["non_stroking_color"]) != "white"
+                      and "店休" not in w["text"] and "休" not in _undouble(w["text"])]
+            if badges:
+                badges.sort(key=lambda w: (round(w["top"]), w["x0"]))
+                info.label = norm("".join(_undouble(w["text"]) for w in badges))
             if any("店休日" in w["text"] for w in inside):
                 info.closed = True
             if info.kind == "fair":
@@ -216,18 +250,31 @@ def parse_menu(path_or_file) -> MenuMaster:
             elif info.kind in KIND_LABEL:
                 info.flag = KIND_LABEL[info.kind]
 
-        # イベントWeek = 複数マスにまたがる太枠
+        # イベントWeek = 複数マスにまたがる太枠(週をまたぐ場合は枠が2つ)
+        cell_w = min((b[2] - b[0]) for b in boxes.values()) if boxes else 100
+        ev_days = set()
         for r in rects + page.curves:
             w, h = r["x1"] - r["x0"], r["bottom"] - r["top"]
-            if r.get("stroke") and w > 400 and 130 < h < 170:
-                inside = sorted(d for d, (x0, top, x1, bottom) in boxes.items()
-                                if x0 >= r["x0"] - 5 and x1 <= r["x1"] + 5
-                                and top >= r["top"] - 5 and bottom <= r["bottom"] + 5)
-                if inside:
-                    master.event_range = (inside[0], inside[-1])
+            if r.get("stroke") and w > cell_w * 1.8 and abs(h - cell_h) < cell_h * 0.15:
+                inside = [d for d, (x0, top, x1, bottom) in boxes.items()
+                          if x0 >= r["x0"] - 5 and x1 <= r["x1"] + 5
+                          and top >= r["top"] - 5 and bottom <= r["bottom"] + 5]
+                if len(inside) >= 2:
+                    ev_days.update(inside)
+        if ev_days:
+            master.event_range = (min(ev_days), max(ev_days))
 
         if not master.days:
             master.warnings.append("中面から日付マスを読み取れませんでした")
+        elif month:
+            import datetime as _dt
+            # 年が分からないので、2月は28/29日のどちらでもよしとする
+            need = 28 if month == 2 else calendar.monthrange(2001, month)[1]
+            missing = [d for d in range(1, need + 1) if d not in master.days]
+            if missing:
+                master.warnings.append(
+                    "中面から読み取れなかった日付があります: " + "・".join(map(str, missing))
+                    + "日(表の内容を確認してください)")
         return master
 
 
@@ -242,7 +289,7 @@ class FaxCell:
     black_box: bool = False   # 日付が黒地(白抜き数字)
     gray: bool = False        # グレーの日付
     flag: str = ""
-    mazegohan: bool = False
+    rice: str = ""
     closed: bool = False
     event_text: str = ""
 
@@ -259,6 +306,16 @@ class FaxPage:
     zeitaku: bool = False
     cells: list[FaxCell] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+    @property
+    def label(self):
+        """表示用の店舗名(番号が重ならないように)"""
+        name = self.store_name
+        if not name:
+            return self.store_no
+        if self.store_no and not name.startswith(self.store_no):
+            return f"{self.store_no}_{name}"
+        return name
 
     @property
     def variant(self):
@@ -298,7 +355,7 @@ def parse_fax_page(page, page_no, img=None, scale=2.0) -> FaxPage:
     m = re.search(r"店舗番号\s*(\d+)", text)
     fp.store_no = m.group(1) if m else ""
     first = text.splitlines()[0] if text else ""
-    fp.store_name = re.sub(r"\s*\d{3}-\d{3}\s*$", "", first).strip()
+    fp.store_name = re.sub(r"\s*\d{3}-\d{3,4}\s*$", "", first).strip()
     if "注文内容" in fp.store_name:
         fp.store_name = ""
 
@@ -395,13 +452,15 @@ def parse_fax_page(page, page_no, img=None, scale=2.0) -> FaxPage:
                  and c["size"] > 3 and visible_white(c)]
         cell.flag = norm(vertical_text(label))
         rest = list(white)
-        if all(any(c["text"] == ch for c in rest) for ch in "混ぜご飯"):
-            cell.mazegohan = True
-            for ch in "混ぜご飯贅沢弁当":
-                for c in rest:
-                    if c["text"] == ch:
-                        rest.remove(c)
-                        break
+        for word in ("混ぜご飯", "ふりかけ"):
+            if all(any(c["text"] == ch for c in rest) for ch in word):
+                cell.rice = word
+                for ch in word + "贅沢弁当":
+                    for c in rest:
+                        if c["text"] == ch:
+                            rest.remove(c)
+                            break
+                break
         if norm("".join(c["text"] for c in rest)):
             cell.event_text = norm(vertical_text(rest))
         # 店休日 = 日付がグレー(見た目)。「店休日」の文字は下に隠れていることがあるため使わない
@@ -468,7 +527,7 @@ class Issue:
 def check_page(fp: FaxPage, master: MenuMaster, year: int, month: int,
                event_name: str = "") -> list[Issue]:
     issues = []
-    store = f"{fp.store_no} {fp.store_name}".strip()
+    store = fp.label
 
     def add(item, day, exp, act, level="エラー"):
         issues.append(Issue(fp.page_no, store, item, str(day), str(exp), str(act), level))
@@ -487,15 +546,17 @@ def check_page(fp: FaxPage, master: MenuMaster, year: int, month: int,
     # ② 曜日と日付
     visible = [c for c in fp.cells if not c.hidden]
     seen = {}
-    in_month_started = False
+    rows = sorted({c.row for c in visible})
     for c in sorted(visible, key=lambda c: (c.row, WEEKDAYS.find(c.weekday))):
-        if c.day == 1:
-            in_month_started = True
-        if not in_month_started:
+        # 1行目の大きい数字=前月、最後の行の小さい数字=翌月
+        if rows and c.row == rows[0] and c.day > 7:
             add("②曜日", c.day, "前月の日付は斜線で消す", f"{c.day}日が表示されています")
             continue
-        if c.day in seen:  # 翌月の1日など
+        if rows and c.row in rows[-2:] and c.day < 7 and len(rows) > 2:
             add("②曜日", c.day, "翌月の日付は斜線で消す", f"{c.day}日が表示されています")
+            continue
+        if c.day in seen:
+            add("②曜日", c.day, "同じ日付が2回あります", f"{c.day}日が重複")
             continue
         if not 1 <= c.day <= last:
             add("②曜日", c.day, f"{month}月は{last}日まで", f"{c.day}日が表示されています")
@@ -516,15 +577,15 @@ def check_page(fp: FaxPage, master: MenuMaster, year: int, month: int,
         if c.closed:
             continue
         mi = master.days.get(d) or DayInfo(d)
-        if norm(mi.flag) != norm(c.flag):
-            add("③旗日", d, mi.flag or "(なし)", c.flag or "(なし)")
+        exp_text = mi.flag or mi.label
+        if norm(exp_text) != norm(c.flag):
+            add("③旗日", d, exp_text or "(なし)", c.flag or "(なし)")
         if bool(mi.flag) != c.black_box:
             add("③旗日", d, "日付を黒地に" if mi.flag else "日付は白地",
                 "黒地" if c.black_box else "白地")
-        exp_maze = mi.mazegohan and fp.zeitaku
-        if exp_maze != c.mazegohan:
-            add("③混ぜご飯", d, "混ぜご飯あり" if exp_maze else "混ぜご飯なし",
-                "混ぜご飯あり" if c.mazegohan else "混ぜご飯なし")
+        exp_rice = mi.rice if fp.zeitaku else ""
+        if exp_rice != c.rice:
+            add("③混ぜご飯", d, exp_rice or "(なし)", c.rice or "(なし)")
 
     # ④ イベントWeek
     events = [c for c in seen.values() if c.event_text]
@@ -537,7 +598,9 @@ def check_page(fp: FaxPage, master: MenuMaster, year: int, month: int,
             got = (int(m.group(1)), int(m.group(2))) if m else None
             if got != (s, e):
                 add("④イベント", c.day, f"期間 {s}日〜{e}日", c.event_text)
-            if c.day != s:
+            # 表記の位置:開始日、または週をまたぐ場合は各週の最初のマス
+            row_firsts = {min((x for x in seen.values() if x.row == c.row), key=lambda x: x.day).day}
+            if not (c.day == s or (s <= c.day <= e and c.day in row_firsts)):
                 add("④イベント", c.day, f"表記は{s}日のマスに", f"{c.day}日のマスにあります")
             if event_name and norm(event_name) not in c.event_text:
                 add("④イベント", c.day, event_name, c.event_text)

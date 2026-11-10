@@ -17,7 +17,7 @@ with st.expander("チェックする内容", expanded=False):
         """
 - **① 年・月・日付**:左上の年・月、期間(例: 12/1〜12/31)
 - **② 曜日**:各日付が正しい曜日の列にあるか、抜けや前月・翌月の日付がないか
-- **③ 旗日の文字**:フェア名・プレミアム・スペシャル、日付の黒地、贅沢版の混ぜご飯
+- **③ 旗日の文字**:フェア名・プレミアム・スペシャル(と中華などの表記)、日付の黒地、贅沢版の混ぜご飯・ふりかけ
 - **④ イベントWeek**:表記と期間
 
 店休日(グレーの日付)は店舗ごとに違うためチェックしません。店休日のマスは③も対象外です。
@@ -70,13 +70,16 @@ rows = []
 for d in range(1, last + 1):
     info = master.days.get(d, DayInfo(d))
     wd = "月火水木金土日"[calendar.weekday(int(year), int(month), d)]
-    rows.append({"日": d, "曜日": wd, "旗日の文字": info.flag,
-                 "混ぜご飯": info.mazegohan, "店休日": info.closed})
+    rows.append({"日": d, "曜日": wd, "旗日の文字": info.flag, "その他の表記": info.label,
+                 "贅沢のご飯": info.rice, "店休日": info.closed})
 edited = st.data_editor(
     pd.DataFrame(rows), hide_index=True, use_container_width=True, height=300,
     disabled=["日", "曜日"],
     column_config={
-        "旗日の文字": st.column_config.TextColumn(help="例: スペシャル / プレミアム / スタミナフェア"),
+        "旗日の文字": st.column_config.TextColumn(help="日付が黒地になる日。例: スペシャル / プレミアム / スタミナフェア"),
+        "その他の表記": st.column_config.TextColumn(help="日付は白地のまま入る表記。例: 中華"),
+        "贅沢のご飯": st.column_config.SelectboxColumn(options=["", "混ぜご飯", "ふりかけ"],
+                                                    help="贅沢版に入る「混ぜご飯」「ふりかけ」"),
     },
 )
 
@@ -96,7 +99,9 @@ for r in edited.to_dict("records"):
     flag = (r["旗日の文字"] or "").strip()
     kind = "premium" if flag == "プレミアム" else "special" if flag == "スペシャル" else ("fair" if flag else "")
     fixed.days[int(r["日"])] = DayInfo(int(r["日"]), flag=flag, kind=kind,
-                                      mazegohan=bool(r["混ぜご飯"]), closed=bool(r["店休日"]))
+                                      rice=(r["贅沢のご飯"] or "").strip(),
+                                      label=(r["その他の表記"] or "").strip(),
+                                      closed=bool(r["店休日"]))
 fixed.event_range = (int(ev_s), int(ev_e)) if has_event else None
 
 # ------------------------------------------------------------ 2. FAX注文書
@@ -156,7 +161,7 @@ for f in fax_files:
             marks["④イベント"] = "✅(なし)"
         summary.append({
             "判定": "❌ エラー" if n_err else "✅ OK",
-            "ページ": fp.page_no, "店舗": fp.store_name or fp.store_no, "種類": fp.variant,
+            "ページ": fp.page_no, "店舗": fp.label, "種類": fp.variant,
             **marks,
             "エラーの内容": " ／ ".join(describe(i) for i in page_issues),
             "ファイル": f.name, "エラー": n_err,
@@ -167,7 +172,8 @@ st.header("3. 結果")
 
 # 校正した項目と、照合に使った正しい内容
 flags = [f"{d}日 {v.flag}" for d, v in sorted(fixed.days.items()) if v.flag]
-maze = [str(d) for d, v in sorted(fixed.days.items()) if v.mazegohan]
+flags += [f"{d}日 {v.label}(白地)" for d, v in sorted(fixed.days.items()) if v.label]
+rice = [f"{d}日 {v.rice}" for d, v in sorted(fixed.days.items()) if v.rice]
 first_wd = "月火水木金土日"[calendar.weekday(int(year), int(month), 1)]
 checked = pd.DataFrame([
     {"項目": "①年月日", "校正した内容": "左上の年・月・期間",
@@ -176,8 +182,8 @@ checked = pd.DataFrame([
      "正しい内容": f"{month}月1日は{first_wd}曜、{last}日まで"},
     {"項目": "③旗日", "校正した内容": "旗日の文字と、日付の黒地",
      "正しい内容": "、".join(flags) or "なし"},
-    {"項目": "③混ぜご飯", "校正した内容": "贅沢版の混ぜご飯の表記(通常版は表記がないこと)",
-     "正しい内容": ("・".join(maze) + "日") if maze else "なし"},
+    {"項目": "③混ぜご飯", "校正した内容": "贅沢版の混ぜご飯・ふりかけの表記(通常版は表記がないこと)",
+     "正しい内容": "、".join(rice) or "なし"},
     {"項目": "④イベント", "校正した内容": "イベントWeekの表記と期間",
      "正しい内容": (f"{event_name + ' ' if event_name else ''}{fixed.event_range[0]}日〜{fixed.event_range[1]}日"
                 if fixed.event_range else "なし")},
@@ -225,13 +231,6 @@ st.dataframe(
     },
 )
 st.caption("セルにマウスを乗せると全文が見られます。")
-
-if not idf.empty:
-    with st.expander("指摘の一覧(1件ずつ)"):
-        d = idf.rename(columns={"file": "ファイル", "page": "ページ", "store": "店舗", "item": "項目",
-                                "day": "日", "expected": "正しい内容", "actual": "注文書の内容", "level": "区分"})
-        st.dataframe(d[["ページ", "店舗", "項目", "日", "注文書の内容", "正しい内容", "ファイル"]],
-                     hide_index=True, use_container_width=True)
 
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as xw:
