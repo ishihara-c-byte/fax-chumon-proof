@@ -64,7 +64,8 @@ today = dt.date.today()
 c1, c2 = st.columns(2)
 month = c1.selectbox("月", list(range(1, 13)),
                      index=(master.month or today.month) - 1)
-default_year = today.year + (1 if (master.month or today.month) < today.month else 0)
+# 年の初期値:基本は今年。月が今月より半年以上前なら来年(例:12月に1月号を校正)
+default_year = today.year + (1 if (master.month or today.month) < today.month - 6 else 0)
 year = c2.number_input("年", min_value=2020, max_value=2100, value=default_year, step=1)
 last = calendar.monthrange(int(year), int(month))[1]
 
@@ -74,14 +75,14 @@ for d in range(1, last + 1):
     info = master.days.get(d, DayInfo(d))
     wd = "月火水木金土日"[calendar.weekday(int(year), int(month), d)]
     rows.append({"日": d, "曜日": wd, "旗日の文字": info.flag, "その他の表記": info.label,
-                 "贅沢のご飯": info.rice, "店休日": info.closed})
+                 "贅沢のご飯": info.rice or "なし", "店休日": info.closed})
 edited = st.data_editor(
     pd.DataFrame(rows), hide_index=True, use_container_width=True, height=300,
     disabled=["日", "曜日"],
     column_config={
         "旗日の文字": st.column_config.TextColumn(help="日付が黒地になる日。例: スペシャル / プレミアム / スタミナフェア"),
         "その他の表記": st.column_config.TextColumn(help="日付は白地のまま入る表記。例: 中華"),
-        "贅沢のご飯": st.column_config.SelectboxColumn(options=["", "混ぜご飯", "ふりかけ"],
+        "贅沢のご飯": st.column_config.SelectboxColumn(options=["なし", "混ぜご飯", "ふりかけ"],
                                                     help="贅沢版に入る「混ぜご飯」「ふりかけ」"),
     },
 )
@@ -102,7 +103,7 @@ for r in edited.to_dict("records"):
     flag = (r["旗日の文字"] or "").strip()
     kind = "premium" if flag == "プレミアム" else "special" if flag == "スペシャル" else ("fair" if flag else "")
     fixed.days[int(r["日"])] = DayInfo(int(r["日"]), flag=flag, kind=kind,
-                                      rice=(r["贅沢のご飯"] or "").strip(),
+                                      rice="" if r["贅沢のご飯"] in (None, "", "なし") else str(r["贅沢のご飯"]).strip(),
                                       label=(r["その他の表記"] or "").strip(),
                                       closed=bool(r["店休日"]))
 fixed.event_range = (int(ev_s), int(ev_e)) if has_event else None
