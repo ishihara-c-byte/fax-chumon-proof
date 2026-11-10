@@ -25,15 +25,18 @@ with st.expander("チェックする内容", expanded=False):
     )
 
 
-@st.cache_data(show_spinner=False)
 def load_menu(data: bytes) -> MenuMaster:
+    # 中面は1ページだけで読み取りが速いため、キャッシュしない
+    # (キャッシュすると、ツールを更新しても古い読み取り結果が残ってしまう)
     return parse_menu(io.BytesIO(data))
 
 
 def load_fax(data: bytes, name: str):
     """読み取り結果はセッション内に保存し、同じファイルは読み直さない"""
     import hashlib
-    key = hashlib.md5(data).hexdigest()
+    import proof_core
+    code = open(proof_core.__file__, "rb").read()  # ツールが更新されたら読み直す
+    key = hashlib.md5(data + code).hexdigest()
     store = st.session_state.setdefault("fax_cache", {})
     if key not in store:
         bar = st.progress(0.0, text=f"{name} を読み取り中…")
