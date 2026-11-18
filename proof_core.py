@@ -300,6 +300,100 @@ def _undouble(t: str) -> str:
     return t
 
 
+def _find_tesseract():
+    import os
+    import shutil
+    p = shutil.which("tesseract")
+    if p:
+        return p
+    for p in (r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+              r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+              "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _is_badge_color(c):
+    """バッジの塗り(赤・オレンジなどのはっきりした色)か"""
+    rgb = _rgb(c)
+    if rgb is None:
+        return False
+    return max(rgb) > 0.6 and max(rgb) - min(rgb) > 0.5
+
+
+def _find_badges(shapes, box):
+    """マスの中の、白抜き文字が図形(アウトライン)になっているバッジを探す
+    (例: 赤い花形の「新年」、オレンジの丸の「混ぜご飯」)"""
+    x0, top, x1, bottom = box
+    cands = []
+    for s in shapes:
+        w, h = s["x1"] - s["x0"], s["bottom"] - s["top"]
+        if not (s.get("fill") and 12 <= w <= 50 and 12 <= h <= 50 and 0.6 <= w / h <= 1.6):
+            continue
+        if not (x0 <= s["x0"] and s["x1"] <= x1 and top <= s["top"] and s["bottom"] <= bottom):
+            continue
+        if not _is_badge_color(s.get("non_stroking_color")):
+            continue
+        # 中に白い図形(=文字の形)が2つ以上あるものだけ
+        glyphs = [g for g in shapes
+                  if g.get("fill") and color_kind(g.get("non_stroking_color")) == "white"
+                  and s["x0"] - 0.5 <= g["x0"] and g["x1"] <= s["x1"] + 0.5
+                  and s["top"] - 0.5 <= g["top"] and g["bottom"] <= s["bottom"] + 0.5
+                  and (g["x1"] - g["x0"]) < w * 0.9]
+        if len(glyphs) < 2:
+            continue
+        if any(abs(c["x0"] - s["x0"]) < 3 and abs(c["top"] - s["top"]) < 3 for c in cands):
+            continue
+        cands.append(s)
+    return cands
+
+
+def _ocr_badge(pdf_bytes, page_index, page_h, page_w, b, tess, scale=6):
+    """バッジ部分だけを描画し、色地の上の白い文字をOCRで読む"""
+    import os
+    import subprocess
+    import tempfile
+    import numpy as np
+    import pypdfium2 as pdfium
+    from PIL import Image
+
+    doc = pdfium.PdfDocument(pdf_bytes)
+    try:
+        pg = doc[page_index]
+        # crop = 左・下・右・上 から切り落とす幅(pt)
+        crop = (max(0, b["x0"] - 1), max(0, page_h - b["bottom"] - 1),
+                max(0, page_w - b["x1"] - 1), max(0, b["top"] - 1))
+        a = np.asarray(pg.render(scale=scale, crop=crop).to_pil().convert("RGB")).astype(int)
+    finally:
+        doc.close()
+    r, g, bl = a[..., 0], a[..., 1], a[..., 2]
+    white = (r > 170) & (g > 170) & (bl > 170)
+    colored = (np.maximum(np.maximum(r, g), bl) - np.minimum(np.minimum(r, g), bl)) > 80
+    acc = np.maximum.accumulate
+    # 色地に上下左右を囲まれた白 = 文字(外側の白いフチは除く)
+    inside = (acc(colored, axis=1) & acc(colored[:, ::-1], axis=1)[:, ::-1]
+              & acc(colored, axis=0) & acc(colored[::-1], axis=0)[::-1])
+    txt = white & inside
+    if txt.sum() < 20:
+        return ""
+    out = np.pad(np.where(txt, 0, 255).astype("uint8"), 30, constant_values=255)
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        Image.fromarray(out).save(path)
+        res = subprocess.run([tess, path, "-", "-l", "jpn", "--psm", "6"],
+                             capture_output=True, text=True, timeout=30)
+        return norm(res.stdout)
+    except Exception:
+        return ""
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def parse_menu(path_or_file) -> MenuMaster:
     import io
     data = strip_hidden_layers(_to_bytes(path_or_file))
@@ -363,6 +457,8 @@ def parse_menu(path_or_file) -> MenuMaster:
             if k:
                 info.kind = k
 
+        shapes = rects + page.curves
+        tess = _find_tesseract()
         for day, (x0, top, x1, bottom) in boxes.items():
             info = master.days[day]
             inside = [w for w in words if x0 <= w["x0"] < x1 and top <= w["top"] < bottom]
@@ -379,6 +475,20 @@ def parse_menu(path_or_file) -> MenuMaster:
             if badges:
                 badges.sort(key=lambda w: (round(w["top"]), w["x0"]))
                 info.label = norm("".join(_undouble(w["text"]) for w in badges))
+            # 文字が図形化(アウトライン化)されたバッジ(例: 写真の上の赤い「新年」)はOCRで読む
+            for b in _find_badges(shapes, (x0, top, x1, bottom)):
+                txt = _ocr_badge(data, 0, page.height, page.width, b, tess) if tess else ""
+                if txt and ("混ぜ" in txt or "ご飯" in txt):
+                    continue  # 混ぜご飯のマークは③混ぜご飯で別に見ている
+                if not txt:
+                    if not tess and info.rice:
+                        continue  # OCRなし:混ぜご飯の日のマークは混ぜご飯マークとみなす
+                    master.warnings.append(
+                        f"{day}日: 文字が図形になったマークがあり読み取れません(目視で確認してください)")
+                    continue
+                # 旗日以外の表記として扱う(FAX注文書では黒い文字で書き、日付は白地のまま)
+                if txt not in info.label:
+                    info.label = info.label + txt
             if any("店休日" in w["text"] for w in inside):
                 info.closed = True
             if info.kind == "fair":
