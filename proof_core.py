@@ -226,7 +226,14 @@ def _pdfium_visible_text(pdfium_page, left, top, right, bottom, hidden_keys) -> 
             continue
         out.append((round(h - t), l, tp.get_text_range(i, 1)))
     out.sort(key=lambda x: (x[0] // 6, x[1]))
-    return "".join(x[2] for x in out)
+    # 行が変わるところに改行を入れる(年と期間の数字がつながらないように)
+    s, prev = "", None
+    for row, _, ch in out:
+        if prev is not None and row // 6 != prev:
+            s += "\n"
+        s += ch
+        prev = row // 6
+    return s
 
 
 def _to_bytes(path_or_file) -> bytes:
@@ -743,8 +750,12 @@ def parse_fax_page(page, page_no, img=None, scale=2.0) -> FaxPage:
     for t in nums:
         if re.fullmatch(r"20\d\d", t["text"]):
             fp.year = int(t["text"])
-    htxt = norm("".join(c["text"] for c in sorted(header, key=lambda c: (round(c["top"] / 4), c["x0"]))))
-    m = re.search(r"(\d{1,2}/\d{1,2})〜?(\d{1,2}/\d{1,2})", htxt)
+    # 行ごとに区切って読む(区切らないと年「2027」と期間「1/1〜」がつながり「71/1」と読んでしまう)
+    lines = {}
+    for c in sorted(header, key=lambda c: c["x0"]):
+        lines.setdefault(round(c["top"] / 4), []).append(c["text"])
+    htxt = "|".join(norm("".join(v)) for _, v in sorted(lines.items()))
+    m = re.search(r"(?<!\d)(\d{1,2}/\d{1,2})\|?〜?\|?(\d{1,2}/\d{1,2})", htxt)
     if m:
         fp.period = f"{m.group(1)}〜{m.group(2)}"
     # 贅沢版 = 注文表に「贅沢弁当」の行が(見える状態で)ある
@@ -785,7 +796,7 @@ def parse_fax(pdf_bytes: bytes, progress=None, scale=2.0) -> list[FaxPage]:
                         m = re.search(r"20\d\d", txt)
                         fp.year = int(m.group()) if m else None
                     if not fp.period:
-                        m = re.search(r"(\d{1,2}/\d{1,2})\s*[〜~～\-]?\s*(\d{1,2}/\d{1,2})", txt)
+                        m = re.search(r"(?<!\d)(\d{1,2}/\d{1,2})\s*[〜~～\-]?\s*(\d{1,2}/\d{1,2})", txt)
                         fp.period = f"{m.group(1)}〜{m.group(2)}" if m else ""
                 except Exception:
                     pass
